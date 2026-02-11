@@ -1,0 +1,1 @@
+export { useQueryClient } from './QueryClientProvider'
