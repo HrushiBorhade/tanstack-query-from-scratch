@@ -1,203 +1,374 @@
 # TanStack Query — From Scratch
 
-A ground-up TypeScript implementation of [TanStack Query](https://tanstack.com/query) (formerly React Query), built to deeply understand async state management, the observer pattern, request deduplication, and React 18 internals.
+A from-scratch TypeScript implementation of [TanStack Query](https://tanstack.com/query) for learning: async state management, observer pattern, request deduplication, and React internals. Educational project — not a drop-in replacement.
 
-> 137 tests passing &nbsp;|&nbsp; 0 TypeScript errors &nbsp;|&nbsp; 0 ESLint warnings &nbsp;|&nbsp; 177 kB bundle (55 kB gzip)
+**Problems it solves:**
+
+| Problem                       | How this project handles it                                               |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| Duplicate requests            | Same `queryKey` → one shared `Query` → one network call                   |
+| Stale data                    | `staleTime`, background refetch, focus/online refetch                     |
+| Loading state mess            | Single `QueryState` with derived flags: `isLoading`, `isRefetching`, etc. |
+| “Spinner or old data?”        | Dual-axis state: `QueryStatus` (data) + `FetchStatus` (network)           |
+| N re-renders for N observers  | `notifyManager` batches callbacks → one React render                      |
+| Data when user navigates back | Deferred GC: data stays for `gcTime` after last observer                  |
+| Optimistic updates            | Mutation: `onMutate` → context → `onError`/`onSettled` for rollback       |
+| Retries                       | `Retryer` with exponential backoff and cancellation                       |
 
 ---
 
-## Overview
+## Contents
 
-This project re-implements the core of TanStack Query from first principles — no source code referenced, only the public API and behaviour as a specification. Every subsystem is written in TypeScript with native `#` private fields, strict types, and full test coverage.
-
-The goal is not a drop-in replacement. It is an educational artefact: a codebase where every design decision has a documented reason.
+- [TanStack Query — From Scratch](#tanstack-query--from-scratch)
+  - [Contents](#contents)
+  - [Architecture (7 layers)](#architecture-7-layers)
+  - [Components and how they connect](#components-and-how-they-connect)
+  - [Query state: two axes](#query-state-two-axes)
+  - [Request lifecycle (useQuery)](#request-lifecycle-usequery)
+  - [Request deduplication](#request-deduplication)
+  - [Garbage collection (deferred removal)](#garbage-collection-deferred-removal)
+  - [Mutation flow (simplified)](#mutation-flow-simplified)
+  - [Design patterns](#design-patterns)
+  - [File map](#file-map)
+  - [Getting started](#getting-started)
+  - [Documentation](#documentation)
+  - [Tech stack](#tech-stack)
 
 ---
 
-## Architecture
+## Architecture (7 layers)
 
-The implementation is split into 7 layers. Each layer only depends on the one below it.
+Each layer only depends on the one below it.
 
+```mermaid
+flowchart TB
+  subgraph L7["Layer 7 — React Bindings"]
+    useQuery["useQuery"]
+    useMutation["useMutation"]
+    QueryClientProvider["QueryClientProvider"]
+  end
+
+  subgraph L6["Layer 6 — QueryClient"]
+    QC["QueryClient"]
+  end
+
+  subgraph L5["Layer 5 — Observers"]
+    QObs["QueryObserver"]
+    MObs["MutationObserver"]
+  end
+
+  subgraph L4["Layer 4 — Caches"]
+    QCache["QueryCache"]
+    MCache["MutationCache"]
+  end
+
+  subgraph L3["Layer 3 — State Machines"]
+    Query["Query"]
+    Mutation["Mutation"]
+  end
+
+  subgraph L2["Layer 2 — Infrastructure"]
+    Retryer["Retryer"]
+    FocusManager["FocusManager"]
+    OnlineManager["OnlineManager"]
+  end
+
+  subgraph L1["Layer 1 — Primitives"]
+    types["types"]
+    utils["utils"]
+    Subscribable["Subscribable"]
+    NotifyManager["NotifyManager"]
+    Removable["Removable"]
+  end
+
+  L7 --> L6
+  L6 --> L5
+  L5 --> L4
+  L4 --> L3
+  L3 --> L2
+  L2 --> L1
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 7 │ React Bindings                                     │
-│          │  useQuery · useMutation · QueryClientProvider      │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 6 │ QueryClient                                        │
-│          │  Public façade / API surface                       │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 5 │ Observers                                          │
-│          │  QueryObserver · MutationObserver                  │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 4 │ Caches                                             │
-│          │  QueryCache · MutationCache                        │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 3 │ State Machines                                     │
-│          │  Query · Mutation                                  │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 2 │ Infrastructure                                     │
-│          │  Retryer · FocusManager · OnlineManager            │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 1 │ Primitives                                         │
-│          │  types · utils · Subscribable · NotifyManager      │
-│          │  Removable                                         │
-└──────────────────────────────────────────────────────────────┘
+
+| Layer                  | Responsibility                                                                        |
+| ---------------------- | ------------------------------------------------------------------------------------- |
+| **1 — Primitives**     | Types, `hashQueryKey`/`matchesQueryKey`, `Subscribable`, `NotifyManager`, `Removable` |
+| **2 — Infrastructure** | `Retryer`, `FocusManager`, `OnlineManager`                                            |
+| **3 — State Machines** | `Query`, `Mutation` (reducer + fetch/mutation lifecycle)                              |
+| **4 — Caches**         | `QueryCache`, `MutationCache` — Map by key, event emission                            |
+| **5 — Observers**      | `QueryObserver`, `MutationObserver` — bridge to React, compute result, decide refetch |
+| **6 — QueryClient**    | Public API: `fetchQuery`, `getQueryData`, `invalidateQueries`, etc.                   |
+| **7 — React Bindings** | `QueryClientProvider`, `useQuery`, `useMutation` — `useSyncExternalStore` + observer  |
+
+---
+
+## Components and how they connect
+
+```mermaid
+flowchart LR
+  subgraph React["React tree"]
+    Component["Component"]
+    useQuery["useQuery()"]
+  end
+
+  subgraph Observer["Layer 5"]
+    QObs["QueryObserver"]
+  end
+
+  subgraph Cache["Layer 4"]
+    QCache["QueryCache"]
+    Query["Query"]
+  end
+
+  subgraph Infra["Layer 2"]
+    Retryer["Retryer"]
+  end
+
+  subgraph Prim["Layer 1"]
+    NotifyManager["NotifyManager"]
+    Subscribable["Subscribable"]
+  end
+
+  Component --> useQuery
+  useQuery --> QObs
+  QObs -->|"subscribe / getOptimisticResult"| Query
+  QObs -->|"build() / find"| QCache
+  QCache --> Query
+  Query --> Retryer
+  Query --> Subscribable
+  Query --> NotifyManager
+  QObs --> Subscribable
+```
+
+- **QueryCache** — Only place that creates `Query` (via `build()`). Key = `hashQueryKey(queryKey)`.
+- **Query** — One per query key. State (reducer), fetch via `Retryer`, extends `Subscribable` + `Removable`.
+- **QueryObserver** — One per `useQuery`. Subscribes to `Query`, computes `QueryObserverResult`, decides refetch.
+- **useQuery** — Context → `QueryObserver` → `useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)`.
+
+---
+
+## Query state: two axes
+
+“Do we have data?” and “Is a request in flight?” are independent.
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> pending: no data yet
+  pending --> success: data received
+  pending --> error: error received
+  success --> success: background refetch
+  success --> error: refetch failed
+  error --> success: retry succeeded
+  error --> error: retry again / give up
+
+  note right of pending
+    QueryStatus: pending | success | error
+  end note
+  note right of success
+    FetchStatus: fetching | paused | idle
+  end note
+```
+
+| status + fetchStatus   | Meaning                                     |
+| ---------------------- | ------------------------------------------- |
+| `success` + `idle`     | Fresh data, no request.                     |
+| `success` + `fetching` | Background refetch — show data, no spinner. |
+| `pending` + `fetching` | First load — show loading.                  |
+| `error` + `fetching`   | Retrying after error.                       |
+
+---
+
+## Request lifecycle (useQuery)
+
+From “component renders with `useQuery(['users'])`” to “component re-renders with data.”
+
+```mermaid
+sequenceDiagram
+  participant Component
+  participant useQuery
+  participant QueryObserver
+  participant QueryCache
+  participant Query
+  participant Retryer
+  participant queryFn
+  participant NotifyManager
+  participant React
+
+  Component->>useQuery: render, useQuery(['users'])
+  useQuery->>QueryObserver: new QueryObserver(client, options)
+  useQuery->>QueryObserver: subscribe(onStoreChange)
+  QueryObserver->>QueryCache: build(client, options)
+  QueryCache->>QueryCache: hashQueryKey → get or create Query
+  QueryCache-->>QueryObserver: Query
+  QueryObserver->>Query: addObserver(observer)
+
+  useQuery->>QueryObserver: getOptimisticResult(options)
+  QueryObserver->>Query: state (stale? should fetch on mount?)
+  alt should fetch
+    QueryObserver->>Query: fetch()
+    Query->>Query: #dispatch({ type: 'fetch' })
+    Query->>Retryer: new Retryer(...)
+    Query->>Retryer: start()
+    Retryer->>queryFn: queryFn({ queryKey, signal })
+    queryFn-->>Retryer: data
+    Retryer->>Query: onSuccess(data)
+    Query->>Query: setData(data) → #dispatch({ type: 'success', data })
+    Query->>Query: reducer → new state
+    Query->>NotifyManager: batch(() => { ... })
+    Query->>QueryObserver: observer.onQueryUpdate() for each observer
+    QueryObserver->>QueryObserver: getOptimisticResult() → new result
+    QueryObserver->>React: listener(newResult)
+    NotifyManager->>React: flush batched updates
+    React->>Component: re-render with result
+  end
+```
+
+**Short:** Component → useQuery → QueryObserver → QueryCache.build() → Query → Retryer → queryFn → success → dispatch → reducer → notify observers → batch → one re-render.
+
+---
+
+## Request deduplication
+
+Many components, same key ⇒ one `Query` ⇒ one `fetch()`. In-flight fetch returns the same `Retryer.promise`.
+
+```mermaid
+flowchart LR
+  subgraph Components
+    A["useQuery(['users'])"]
+    B["useQuery(['users'])"]
+    C["useQuery(['users'])"]
+  end
+
+  subgraph Cache
+    Query["Query (key: ['users'])"]
+  end
+
+  subgraph Network
+    Retryer["Retryer"]
+    API["API"]
+  end
+
+  A --> Query
+  B --> Query
+  C --> Query
+  Query --> Retryer
+  Retryer --> API
+```
+
+**Notification batching:** One state change can trigger many observer callbacks. `NotifyManager` queues and flushes them once → one React render.
+
+---
+
+## Garbage collection (deferred removal)
+
+Queries stay in cache for `gcTime` after the last observer unsubscribes. Re-mount within that window → data still there (and optional refetch).
+
+```mermaid
+sequenceDiagram
+  participant Observer
+  participant Query
+  participant Removable
+  participant QueryCache
+
+  Observer->>Query: removeObserver(observer)
+  Query->>Query: observer count → 0?
+  alt last observer
+    Query->>Removable: scheduleGc()  [setTimeout(gcTime)]
+    Note over Removable: wait gcTime ms
+    Removable->>Query: optionalRemove()
+    Query->>Query: still no observers?
+    Query->>QueryCache: remove(this)
+  else new observer before timeout
+    Observer->>Query: addObserver(observer)
+    Query->>Removable: clearGcTimeout()
+  end
 ```
 
 ---
 
-## Features Implemented
+## Mutation flow (simplified)
 
-| Feature | Details |
-|---|---|
-| **Request deduplication** | N components with the same query key → 1 network request |
-| **Background refetching** | Stale data shown instantly while a silent refetch runs |
-| **Garbage collection** | Deferred removal with configurable `gcTime` window |
-| **Exponential backoff** | Configurable `retry` count and `retryDelay` function |
-| **Focus refetching** | Stale queries refetch when the browser tab regains focus |
-| **Online refetching** | Paused fetches resume when network connectivity is restored |
-| **Optimistic updates** | `onMutate` context threading to `onError`/`onSettled` for rollback |
-| **Query invalidation** | Prefix-matched `invalidateQueries` with active-observer refetch |
-| **Notification batching** | N state changes in one event → 1 React render via `notifyManager` |
-| **`useSyncExternalStore`** | Concurrent-mode safe, tearing-free, SSR-compatible bindings |
-| **Dual-axis state** | `QueryStatus` (pending/success/error) orthogonal to `FetchStatus` (fetching/paused/idle) |
+One-off actions. Lifecycle: `onMutate` (optional optimistic update) → `mutationFn` → `onSuccess` or `onError` → `onSettled`. `onMutate` return value is `context` for rollback in `onError`/`onSettled`.
+
+```mermaid
+sequenceDiagram
+  participant Component
+  participant useMutation
+  participant MutationObserver
+  participant MutationCache
+  participant Mutation
+  participant mutationFn
+
+  Component->>useMutation: mutate(variables)
+  useMutation->>MutationObserver: mutate(variables)
+  MutationObserver->>MutationCache: build(options)
+  MutationCache->>Mutation: new Mutation()
+  Mutation->>Mutation: onMutate() → context
+  Mutation->>mutationFn: mutationFn(variables)
+  alt success
+    mutationFn-->>Mutation: data
+    Mutation->>Mutation: onSuccess(data)
+    Mutation->>Mutation: onSettled(data, null)
+  else error
+    mutationFn-->>Mutation: error
+    Mutation->>Mutation: onError(error) — context for rollback
+    Mutation->>Mutation: onSettled(undefined, error)
+  end
+  Mutation->>MutationObserver: notify
+  MutationObserver->>Component: new result
+```
 
 ---
 
-## Getting Started
+## Design patterns
+
+| Pattern                   | Where                                       | Purpose                                |
+| ------------------------- | ------------------------------------------- | -------------------------------------- |
+| **Observer (pub/sub)**    | `Subscribable`                              | Decouple state changes from who reacts |
+| **State machine**         | `Query` / `Mutation` reducer                | Pure transitions, easy to test         |
+| **Deferred GC**           | `Removable`                                 | Fast back-navigation within `gcTime`   |
+| **Request deduplication** | `Query.fetch()` + `Retryer.promise`         | N observers ⇒ 1 network request        |
+| **Notification batching** | `NotifyManager`                             | N state changes ⇒ 1 React render       |
+| **Façade**                | `QueryClient`                               | Single public API                      |
+| **useSyncExternalStore**  | `useQuery` / `useMutation`                  | Tearing-safe, SSR-friendly             |
+| **Context threading**     | Mutation `onMutate` → `onError`/`onSettled` | Optimistic updates + rollback          |
+
+---
+
+## File map
+
+| Layer | Files                                                                           |
+| ----- | ------------------------------------------------------------------------------- |
+| 1     | `types.ts`, `utils.ts`, `subscribable.ts`, `notifyManager.ts`, `removable.ts`   |
+| 2     | `retryer.ts`, `focusManager.ts`, `onlineManager.ts`                             |
+| 3     | `query.ts`, `mutation.ts`                                                       |
+| 4     | `queryCache.ts`, `mutationCache.ts`                                             |
+| 5     | `queryObserver.ts`, `mutationObserver.ts`                                       |
+| 6     | `queryClient.ts`                                                                |
+| 7     | `QueryClientProvider.tsx`, `useQuery.ts`, `useMutation.ts`, `useQueryClient.ts` |
+
+---
+
+## Getting started
 
 **Prerequisites:** Node.js 18+
 
 ```bash
-# Install dependencies
 npm install
-
-# Start the interactive demo
-npm run dev
-
-# Run all tests
-npm test
-
-# Run tests in watch mode
-npm run test:watch
-
-# Type-check without emitting
-npm run typecheck
-
-# Build for production
-npm run build
-```
-
----
-
-## Project Structure
-
-```
-src/
-├── core/
-│   ├── types.ts              Layer 1 — All TypeScript interfaces and type aliases
-│   ├── utils.ts              Layer 1 — hashQueryKey, matchesQueryKey, helpers
-│   ├── subscribable.ts       Layer 1 — Observer-pattern base class
-│   ├── notifyManager.ts      Layer 1 — Batched notification scheduler
-│   ├── removable.ts          Layer 1 — Garbage-collection base class
-│   ├── retryer.ts            Layer 2 — Retry engine with backoff and cancellation
-│   ├── focusManager.ts       Layer 2 — Browser tab visibility detection
-│   ├── onlineManager.ts      Layer 2 — Network connectivity detection
-│   ├── query.ts              Layer 3 — Query state machine
-│   ├── mutation.ts           Layer 3 — Mutation state machine
-│   ├── queryCache.ts         Layer 4 — Map<hash, Query> with typed event emission
-│   ├── mutationCache.ts      Layer 4 — Map<id, Mutation> with typed event emission
-│   ├── queryObserver.ts      Layer 5 — Query → React component bridge
-│   ├── mutationObserver.ts   Layer 5 — Mutation → React component bridge
-│   ├── queryClient.ts        Layer 6 — Public API façade
-│   └── index.ts              Re-exports
-├── react/
-│   ├── QueryClientProvider.tsx   Context provider + mount/unmount lifecycle
-│   ├── useQueryClient.ts         useContext wrapper
-│   ├── useQuery.ts               useSyncExternalStore + QueryObserver
-│   ├── useMutation.ts            useSyncExternalStore + MutationObserver
-│   └── index.ts                  Re-exports
-└── demo/                         Interactive demo app (Vite + React)
-tests/
-├── utils.test.ts
-├── subscribable.test.ts
-├── query.test.ts
-├── queryCache.test.ts
-├── mutation.test.ts
-└── queryClient.test.ts
-```
-
----
-
-## Key Design Decisions
-
-### Dual-axis query state
-
-`QueryStatus` and `FetchStatus` are independent axes. A query can be `status='success'` and `fetchStatus='fetching'` simultaneously — this is a background refetch. The component renders cached data immediately while the silent update runs.
-
-```
-QueryStatus:   pending | success | error    — do we have data?
-FetchStatus:   fetching | paused | idle     — is a request in flight?
-```
-
-### Request deduplication
-
-`Query.fetch()` checks whether a `Retryer` is already running. If so, it returns the existing `Retryer.promise` rather than creating a new one. 50 components mounting with the same query key produce exactly 1 network request.
-
-### Notification batching
-
-`notifyManager` queues all observer callbacks triggered by a single event and flushes them in one `setTimeout(0)`. The React adapter replaces the flush function with React's own batching primitive, collapsing every queued state update into a single render pass.
-
-### Observer-driven GC
-
-`Removable` schedules garbage collection only when the last observer unsubscribes. If any component re-mounts within the `gcTime` window, the pending timeout is cancelled and data is served from memory. This is what makes navigation feel instant.
-
-### `useSyncExternalStore` over `useState` + `useEffect`
-
-React 18's `useSyncExternalStore` is tearing-safe (no stale reads between render and commit), SSR-compatible via a separate `getServerSnapshot`, and avoids the stale-closure bugs common in manually wired `useEffect` subscriptions.
-
----
-
-## Data Flow
-
-A complete trace of a single `useQuery(['users'])` call:
-
-```
-1.  Component renders → useQuery(['users']) called
-2.  QueryObserver created → subscribes to QueryCache
-3.  useSyncExternalStore calls getOptimisticResult()
-4.  Observer checks: is data stale? should fetch on mount?
-5.  Yes → observer calls query.fetch()
-6.  query.fetch() checks: is a Retryer already running?
-    → No: creates Retryer, dispatches { type: 'fetch' }
-    → Yes: returns existing Retryer.promise (deduplication)
-7.  Retryer calls queryFn({ queryKey, signal })
-8.  queryFn resolves → Retryer calls onSuccess(data)
-9.  Query dispatches { type: 'success' }
-10. Reducer computes new state: status='success', fetchStatus='idle'
-11. Query notifies all observers via onQueryUpdate()
-12. notifyManager batches and schedules the notifications
-13. useSyncExternalStore re-reads snapshot → new result object
-14. React re-renders with the new data
+npm run dev      # Interactive demo
+npm test         # Run tests
+npm run build    # Production build
 ```
 
 ---
 
 ## Documentation
 
-- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — detailed per-file walkthrough of every layer
-- [`DEEP_DIVE.md`](./DEEP_DIVE.md) — deep dive into internals and non-obvious decisions
-- [`PLAN.md`](./PLAN.md) — original implementation plan and task breakdown
-- [`TANSTACK_QUERY_REFERENCE.md`](./TANSTACK_QUERY_REFERENCE.md) — API reference and behaviour notes
+- **[PROJECT_OVERVIEW.md](./PROJECT_OVERVIEW.md)** — Full narrative and the same diagrams in context.
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — Per-file walkthrough of every layer.
 
 ---
 
-## Tech Stack
+## Tech stack
 
-| Tool | Version | Purpose |
-|---|---|---|
-| TypeScript | 5.6 | Strict types, native `#` private fields |
-| React | 18.3 | `useSyncExternalStore`, concurrent mode |
-| Vite | 6.0 | Dev server and production bundler |
-| Vitest | 2.1 | Unit testing with jsdom environment |
-| ESLint + Prettier | 9 / 3 | Linting and formatting |
+TypeScript 5.6 · React 18.3 · Vite 6 · Vitest 2 · ESLint + Prettier
